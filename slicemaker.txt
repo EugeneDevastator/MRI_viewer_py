@@ -1,11 +1,6 @@
-unpack the packed atlas into set of tiles. tile size = 256
-atlas source is ./dataset/packed.png
-ordering is like text left to right top to bottom
-unpack into .\dataset\FrontLD
-LD = LowDensity
 
 given set of images for front FrontLD - generate planar slices
-folders are TopLR and RightLD
+folders are TopLD and RightLD
 if exxists - then skip
 
 then upscaler - upscale each set of slices to 2x resolution.
