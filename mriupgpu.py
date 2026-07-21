@@ -102,16 +102,7 @@ def step_upscale_all(base: Path):
         print(f"Upscaling {name} → {dst.name} ...")
         upscale_folder(src, dst)
 
-
 def step_build_frontmod2hd(base: Path):
-    """
-    Build interleaved front slices using a 512^3 volume approach:
-    1. Load all HD slices into 512^3 array
-    2. Fill FrontHD at even Z positions (priority)
-    3. Fill TopHD and RightHD only into zero voxels
-    4. Estimate unknowns at odd-Z, odd-X, odd-Y positions from 6 neighbors
-    5. Extract interleaved front slices at odd Z positions
-    """
     out_dir = base / "FrontMod2HD"
     ensure(out_dir)
 
@@ -122,104 +113,75 @@ def step_build_frontmod2hd(base: Path):
     HD = SLICE_SIZE * 2  # 512
 
     print("Allocating 512^3 volume...")
-    # vol[hz, hy, hx]  all float32
-    vol = np.zeros((HD, HD, HD), dtype=np.float32)
-    # mask: 1 = filled, 0 = empty
+    vol    = np.zeros((HD, HD, HD), dtype=np.float32)
     filled = np.zeros((HD, HD, HD), dtype=np.uint8)
 
-    # ── 1. FrontHD → even Z positions (priority) ─────────────────────────────
-    # FrontHD[n] maps to hz = n*2
     print(f"Loading FrontHD ({len(front_hd_files)} slices)...")
     for n, f in enumerate(front_hd_files):
         hz = n * 2
-        if hz >= HD:
-            break
+        if hz >= HD: break
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
         vol[hz, :, :] = arr
         filled[hz, :, :] = 1
 
-    # ── 2. TopHD → vol[:, hy, hx] where hy = ld_y*2 ─────────────────────────
-    # TopHD[ld_y] image axes: horizontal=hx, vertical=hz
-    # maps to vol[hz, ld_y*2, hx]
     print(f"Loading TopHD ({len(top_files)} slices)...")
     for ld_y, f in enumerate(top_files):
         hy = ld_y * 2
-        if hy >= HD:
-            break
-        arr = np.array(Image.open(f).convert("L"), dtype=np.float32)  # shape (512, 512) = (hz, hx)
-        mask = filled[:, hy, :]  # shape (512, 512) = (hz, hx)
-        update = mask == 0
-        vol[:, hy, :][update] = arr[update]
-        filled[:, hy, :][update] = 1
+        if hy >= HD: break
+        arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
+        mask = filled[:, hy, :] == 0
+        vol[:, hy, :][mask] = arr[mask]
+        filled[:, hy, :][mask] = 1
 
-    # ── 3. RightHD → vol[:, hy, hx] where hx = ld_x*2 ──────────────────────
-    # RightHD[ld_x] image axes: horizontal=hy, vertical=hz
-    # maps to vol[hz, hy, ld_x*2]
     print(f"Loading RightHD ({len(right_files)} slices)...")
     for ld_x, f in enumerate(right_files):
         hx = ld_x * 2
-        if hx >= HD:
+        if hx >= HD: break
+        arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
+        mask = filled[:, :, hx] == 0
+        vol[:, :, hx][mask] = arr[mask]
+        filled[:, :, hx][mask] = 1
+
+    print("Estimating unknowns (vectorized)...")
+
+    for pass_num in range(4):  # a few passes handles odd+odd+odd corners
+        unfilled = filled == 0
+        count = unfilled.sum()
+        if count == 0:
             break
-        arr = np.array(Image.open(f).convert("L"), dtype=np.float32)  # shape (512, 512) = (hz, hy)
-        mask = filled[:, :, hx]  # shape (512, 512) = (hz, hy)
-        update = mask == 0
-        vol[:, :, hx][update] = arr[update]
-        filled[:, :, hx][update] = 1
+        print(f"  Pass {pass_num+1}: {count} unfilled")
 
-    # ── 4. Estimate unknowns: odd positions not yet filled ────────────────────
-    # These are voxels where hz, hy, or hx is odd and not covered above.
-    # We do a single pass: for each unfilled voxel, average available neighbors.
-    print("Estimating unknown voxels from 6 neighbors...")
+        # accumulate neighbor sum and count vectorized
+        acc   = np.zeros((HD, HD, HD), dtype=np.float32)
+        cnt   = np.zeros((HD, HD, HD), dtype=np.float32)
 
-    # Find all unfilled positions
-    unfilled_hz, unfilled_hy, unfilled_hx = np.where(filled == 0)
-    print(f"  Unfilled voxels: {len(unfilled_hz)}")
+        # 6 neighbors via slicing with padding
+        vp = np.pad(vol,    1, mode='edge')
+        fp = np.pad(filled, 1, mode='edge').astype(np.float32)
 
-    # For each unfilled voxel, collect 6 neighbors (clamp at borders)
-    def get_neighbor(z, y, x):
-        z = int(np.clip(z, 0, HD - 1))
-        y = int(np.clip(y, 0, HD - 1))
-        x = int(np.clip(x, 0, HD - 1))
-        return vol[z, y, x], filled[z, y, x]
+        for dz, dy, dx in [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)]:
+            nz = slice(1+dz, HD+1+dz)
+            ny = slice(1+dy, HD+1+dy)
+            nx = slice(1+dx, HD+1+dx)
+            neighbor_filled = fp[nz, ny, nx]
+            acc += vp[nz, ny, nx] * neighbor_filled
+            cnt += neighbor_filled
 
-    # Vectorized 6-neighbor estimation
-    for axis_pass in range(3):
-        # Multiple passes help propagate values into corners
-        # (odd,odd,odd) voxels need neighbors that may themselves be estimated
-        unfilled_hz, unfilled_hy, unfilled_hx = np.where(filled == 0)
-        if len(unfilled_hz) == 0:
-            break
-        print(f"  Pass {axis_pass+1}: {len(unfilled_hz)} unfilled voxels")
+        has_neighbors = (cnt > 0) & unfilled
+        vol[has_neighbors]    = acc[has_neighbors] / cnt[has_neighbors]
+        filled[has_neighbors] = 1
 
-        for i in range(len(unfilled_hz)):
-            z, y, x = int(unfilled_hz[i]), int(unfilled_hy[i]), int(unfilled_hx[i])
-            neighbors = []
-            for dz, dy, dx in [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)]:
-                nz = np.clip(z+dz, 0, HD-1)
-                ny = np.clip(y+dy, 0, HD-1)
-                nx = np.clip(x+dx, 0, HD-1)
-                if filled[nz, ny, nx]:
-                    neighbors.append(vol[nz, ny, nx])
-            if neighbors:
-                vol[z, y, x] = np.mean(neighbors)
-                filled[z, y, x] = 1
-
-    # ── 5. Extract interleaved front slices at odd Z positions ────────────────
-    # Interleaved slice n sits between FrontLD[n] and FrontLD[n+1] → hz = n*2+1
+    print("Extracting interleaved slices...")
     num_interleaved = TARGET_DEPTH - 1
-    print(f"Extracting {num_interleaved} interleaved slices...")
-
     for n in range(num_interleaved):
         out_path = out_dir / f"{n:04d}.png"
         if out_path.exists():
             continue
         hz = n * 2 + 1
-        slice_arr = vol[hz, :, :]  # shape (512, 512) = (hy, hx)
-        volume_to_image(slice_arr).save(out_path)
-        if n % 20 == 0:
-            print(f"  {n}/{num_interleaved}")
+        volume_to_image(vol[hz, :, :]).save(out_path)
 
     print(f"FrontMod2HD: {num_interleaved} slices done")
+
 
 
 
