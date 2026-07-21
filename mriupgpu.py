@@ -99,12 +99,10 @@ def step_upscale_all(base: Path):
         print(f"Upscaling {name} → {dst.name} ...")
         upscale_folder(src, dst)
 
-
 def step_build_frontmod2hd(base: Path):
     out_dir = base / "FrontMod2HD"
     ensure(out_dir)
 
-    # Check if already done
     existing = sorted(out_dir.glob("*.png"))
     if len(existing) == TARGET_DEPTH:
         print("FrontMod2HD exists, skipping")
@@ -120,7 +118,7 @@ def step_build_frontmod2hd(base: Path):
     vol   = np.zeros((HD, HD, HD), dtype=np.float32)
     count = np.zeros((HD, HD, HD), dtype=np.uint8)
 
-    # FrontHD: vol[hz, hy, hx], even Z positions
+    # FrontHD: even Z positions
     print(f"Loading FrontHD ({len(front_hd_files)} slices)...")
     for n, f in enumerate(front_hd_files):
         hz = n * 2
@@ -129,36 +127,32 @@ def step_build_frontmod2hd(base: Path):
         vol[hz, :, :] += arr
         count[hz, :, :] += 1
 
-    # TopHD: image[ld_y] axes=(hz, hx), placed at even Y positions
+    # TopHD: even Y positions, all Z and X — accumulate freely
     print(f"Loading TopHD ({len(top_files)} slices)...")
     for ld_y, f in enumerate(top_files):
         hy = ld_y * 2
         if hy >= HD: break
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
-        # only fill zeros (FrontHD has priority)
-        mask = count[:, hy, :] == 0
-        vol[:, hy, :][mask] += arr[mask]
-        count[:, hy, :][mask] += 1
+        vol[:, hy, :] += arr
+        count[:, hy, :] += 1
 
-    # RightHD: image[ld_x] axes=(hz, hy), placed at even X positions
+    # RightHD: even X positions, all Z and Y — accumulate freely
     print(f"Loading RightHD ({len(right_files)} slices)...")
     for ld_x, f in enumerate(right_files):
         hx = ld_x * 2
         if hx >= HD: break
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
-        # only fill zeros (FrontHD and TopHD have priority)
-        mask = count[:, :, hx] == 0
-        vol[:, :, hx][mask] += arr[mask]
-        count[:, :, hx][mask] += 1
+        vol[:, :, hx] += arr
+        count[:, :, hx] += 1
 
     print("Averaging accumulated samples...")
     filled_mask = count > 0
     vol[filled_mask] /= count[filled_mask].astype(np.float32)
 
-    # Unknown voxels: all-odd coordinates (odd_z, odd_y, odd_x)
-    # 6 neighbors are all at even coords — guaranteed filled
+    # Estimate unknowns: all-odd coordinates (odd_z, odd_y, odd_x)
+    # All 6 neighbors are at even coords — guaranteed filled by one of the 3 sources
     print("Estimating unknowns (all-odd coordinates, vectorized)...")
-    odd = np.arange(1, HD - 1, 2)  # 1,3,5,...,509
+    odd = np.arange(1, HD - 1, 2)  # 1, 3, 5, ..., 509
     gz, gy, gx = np.meshgrid(odd, odd, odd, indexing='ij')
     gz = gz.ravel()
     gy = gy.ravel()
@@ -174,9 +168,9 @@ def step_build_frontmod2hd(base: Path):
     ], axis=0)
     vol[gz, gy, gx] = neighbors.mean(axis=0)
 
-    # Extract interleaved slices (odd Z positions) — these are 512x512
-    # Shrink to 256x256 (removes interpolation artifacts), then upscale back to 512x512
-    print("Extracting, shrink-then-reupscale interleaved slices...")
+    # Extract interleaved slices at odd Z positions (512x512 each)
+    # Shrink to 256x256 to smooth interpolation artifacts, then neural upscale back to 512x512
+    print("Extracting and reupscaling interleaved slices...")
     for n in range(TARGET_DEPTH):
         out_path = out_dir / f"{n:04d}.png"
         if out_path.exists():
@@ -185,17 +179,16 @@ def step_build_frontmod2hd(base: Path):
         slice_512 = volume_to_image(vol[hz, :, :])  # 512x512
 
         if is_black_image(slice_512):
-            Image.new("L", (SLICE_SIZE * 2, SLICE_SIZE * 2), 0).save(out_path)
+            Image.new("L", (HD, HD), 0).save(out_path)
         else:
-            # Shrink to 256x256 — averages out interpolation artifacts
             slice_256 = slice_512.resize((SLICE_SIZE, SLICE_SIZE), Image.LANCZOS)
-            # Upscale back to 512x512 with neural upscaler — restores detail cleanly
             reales4u2d(slice_256).save(out_path)
 
         if n % 20 == 0:
             print(f"  slice {n}/{TARGET_DEPTH}")
 
     print(f"FrontMod2HD: {TARGET_DEPTH} slices done")
+
 
 
 def step_combine(base: Path):
