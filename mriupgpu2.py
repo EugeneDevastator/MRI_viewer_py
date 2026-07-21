@@ -10,9 +10,10 @@ from PIL import Image
 
 from reales4u2d import load_model, reales4u2d
 
-TARGET_DEPTH = 512   # pad front slices to this many
-SLICE_SIZE   = 512   # each slice is SLICE_SIZE x SLICE_SIZE
-HD           = SLICE_SIZE * 2  # 1024
+TARGET_DEPTH = 512   # pad front slices to this many (Z axis)
+SLICE_SIZE   = 512   # each slice is SLICE_SIZE x SLICE_SIZE (resize if needed)
+HD           = SLICE_SIZE * 2   # 1024
+HZ           = TARGET_DEPTH * 2
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -21,7 +22,13 @@ def ensure(folder: Path):
 
 def load_slices(folder: Path) -> list:
     files = sorted(folder.glob("*.png"))
-    return [Image.open(f).convert("L") for f in files]
+    imgs = []
+    for f in files:
+        img = Image.open(f).convert("L")
+        if img.size != (SLICE_SIZE, SLICE_SIZE):
+            img = img.resize((SLICE_SIZE, SLICE_SIZE), Image.LANCZOS)
+        imgs.append(img)
+    return imgs
 
 def pad_to_depth(slices: list, depth: int) -> list:
     n = len(slices)
@@ -34,7 +41,12 @@ def pad_to_depth(slices: list, depth: int) -> list:
     return [black] * pad_before + slices + [black] * pad_after
 
 def slices_to_volume(slices: list) -> np.ndarray:
-    return np.stack([np.array(s, dtype=np.float32) for s in slices], axis=0)
+    arrays = [np.array(s, dtype=np.float32) for s in slices]
+    # Verify all same shape
+    shapes = set(a.shape for a in arrays)
+    if len(shapes) > 1:
+        raise ValueError(f"Inconsistent slice shapes: {shapes}")
+    return np.stack(arrays, axis=0)
 
 def volume_to_image(arr2d: np.ndarray) -> Image.Image:
     return Image.fromarray(arr2d.clip(0, 255).astype(np.uint8), mode="L")
@@ -45,9 +57,11 @@ def is_black_image(img: Image.Image) -> bool:
 def upscale_folder(src: Path, dst: Path):
     ensure(dst)
     files = sorted(src.glob("*.png"))
+    done  = 0
     for f in files:
         out = dst / f.name
         if out.exists():
+            done += 1
             continue
         img = Image.open(f).convert("L")
         if is_black_image(img):
@@ -55,56 +69,87 @@ def upscale_folder(src: Path, dst: Path):
             Image.new("L", (w * 2, h * 2), 0).save(out)
         else:
             reales4u2d(img).save(out)
+        done += 1
+        if done % 50 == 0:
+            print(f"  {dst.name}: {done}/{len(files)}")
     print(f"  {dst.name}: done ({len(files)} images)")
 
 # ── axis mapping ──────────────────────────────────────────────────────────────
 # vol[Z, Y, X]  shape = (TARGET_DEPTH, SLICE_SIZE, SLICE_SIZE)
 #
-# FrontLD[z] → vol[z, :, :]   saved as (SLICE_SIZE wide, SLICE_SIZE tall)
-# TopLD[y]   → vol[:, y, :]   saved as (SLICE_SIZE wide, TARGET_DEPTH tall)
-# RightLD[x] → vol[:, :, x]   saved as (SLICE_SIZE wide, TARGET_DEPTH tall)
+# FrontLD[z] → vol[z, :, :]
+#   image: width=SLICE_SIZE (X), height=SLICE_SIZE (Y)
+#   numpy arr shape: (SLICE_SIZE, SLICE_SIZE) = (Y, X)
 #
-# After upscale (2x each dimension):
-# FrontHD[z]  → (HD wide,        HD tall)
-# TopHD[y]    → (HD wide,        TARGET_DEPTH*2 tall)
-# RightHD[x]  → (HD wide,        TARGET_DEPTH*2 tall)
+# TopLD[y]   → vol[:, y, :]
+#   numpy slice shape: (TARGET_DEPTH, SLICE_SIZE) = (Z, X)
+#   image: width=SLICE_SIZE (X), height=TARGET_DEPTH (Z)
+#   PIL image size: (SLICE_SIZE, TARGET_DEPTH)
 #
-# HD volume axes: [hz, hy, hx]
-#   hz = z*2 for original front slices, z*2+1 for interleaved
-#   hy = y*2 for original top rows
-#   hx = x*2 for original right cols
+# RightLD[x] → vol[:, :, x]
+#   numpy slice shape: (TARGET_DEPTH, SLICE_SIZE) = (Z, Y)
+#   image: width=SLICE_SIZE (Y), height=TARGET_DEPTH (Z)
+#   PIL image size: (SLICE_SIZE, TARGET_DEPTH)
+#
+# After 2x upscale:
+#   FrontHD[z]:  PIL size (HD, HD),            arr shape (HD, HD)
+#   TopHD[y]:    PIL size (HD, TARGET_DEPTH*2), arr shape (TARGET_DEPTH*2, HD)
+#   RightHD[x]:  PIL size (HD, TARGET_DEPTH*2), arr shape (TARGET_DEPTH*2, HD)
+#
+# HD volume: vol_hd[HZ, HY, HX]
+#   HZ = TARGET_DEPTH*2, HY = HD, HX = HD
+#   FrontHD[n] → vol_hd[n*2,  :,  :]   arr[row=hy, col=hx]
+#   TopHD[y]   → vol_hd[:,  y*2,  :]   arr[row=hz, col=hx]
+#   RightHD[x] → vol_hd[:,    :, x*2]  arr[row=hz, col=hy]
 
 # ── pipeline steps ────────────────────────────────────────────────────────────
 
 def step_generate_top_right(base: Path, vol: np.ndarray):
     """
     vol shape: (Z, Y, X) = (TARGET_DEPTH, SLICE_SIZE, SLICE_SIZE)
-    TopLD[y]:   image of shape (X wide, Z tall) = (SLICE_SIZE, TARGET_DEPTH)
-    RightLD[x]: image of shape (Y wide, Z tall) = (SLICE_SIZE, TARGET_DEPTH)
+    TopLD[y]:   PIL size (SLICE_SIZE, TARGET_DEPTH)  i.e. width=X, height=Z
+    RightLD[x]: PIL size (SLICE_SIZE, TARGET_DEPTH)  i.e. width=Y, height=Z
     """
     top_dir   = base / "TopLD"
     right_dir = base / "RightLD"
-    Z, Y, X   = vol.shape  # (TARGET_DEPTH, SLICE_SIZE, SLICE_SIZE)
+    Z, Y, X   = vol.shape
+
+    print(f"Volume shape: Z={Z}, Y={Y}, X={X}")
 
     if not top_dir.exists():
         ensure(top_dir)
         for y in range(Y):
-            # vol[:, y, :] shape = (Z, X) → image width=X, height=Z
-            img = Image.fromarray(vol[:, y, :].clip(0,255).astype(np.uint8), mode="L")
+            # vol[:, y, :] → shape (Z, X) → PIL(width=X, height=Z)
+            arr = vol[:, y, :].clip(0, 255).astype(np.uint8)  # shape (Z, X)
+            img = Image.fromarray(arr, mode="L")               # PIL size (X, Z)
+            assert img.size == (X, Z), f"TopLD size mismatch: {img.size} vs ({X},{Z})"
             img.save(top_dir / f"{y:04d}.png")
-        print(f"TopLD generated: {Y} slices, each {X}w x {Z}h")
+        print(f"TopLD generated: {Y} slices, PIL size ({X}w x {Z}h)")
     else:
-        print("TopLD exists, skipping")
+        # Verify existing
+        sample = sorted(top_dir.glob("*.png"))
+        if sample:
+            s = Image.open(sample[0])
+            print(f"TopLD exists: {len(sample)} slices, PIL size {s.size} (expected ({X}w x {Z}h))")
+        else:
+            print("TopLD exists but empty!")
 
     if not right_dir.exists():
         ensure(right_dir)
         for x in range(X):
-            # vol[:, :, x] shape = (Z, Y) → image width=Y, height=Z
-            img = Image.fromarray(vol[:, :, x].clip(0,255).astype(np.uint8), mode="L")
+            # vol[:, :, x] → shape (Z, Y) → PIL(width=Y, height=Z)
+            arr = vol[:, :, x].clip(0, 255).astype(np.uint8)  # shape (Z, Y)
+            img = Image.fromarray(arr, mode="L")               # PIL size (Y, Z)
+            assert img.size == (Y, Z), f"RightLD size mismatch: {img.size} vs ({Y},{Z})"
             img.save(right_dir / f"{x:04d}.png")
-        print(f"RightLD generated: {X} slices, each {Y}w x {Z}h")
+        print(f"RightLD generated: {X} slices, PIL size ({Y}w x {Z}h)")
     else:
-        print("RightLD exists, skipping")
+        sample = sorted(right_dir.glob("*.png"))
+        if sample:
+            s = Image.open(sample[0])
+            print(f"RightLD exists: {len(sample)} slices, PIL size {s.size} (expected ({Y}w x {Z}h))")
+        else:
+            print("RightLD exists but empty!")
 
 
 def step_upscale_all(base: Path):
@@ -128,67 +173,84 @@ def step_build_frontmod2hd(base: Path):
     top_files      = sorted((base / "TopHD").glob("*.png"))
     right_files    = sorted((base / "RightHD").glob("*.png"))
 
-    # HD volume dimensions
-    HZ = TARGET_DEPTH * 2   # z axis in HD space
-    HY = SLICE_SIZE   * 2   # y axis in HD space  (= HD)
-    HX = SLICE_SIZE   * 2   # x axis in HD space  (= HD)
+    # Verify sizes from actual files
+    def check_size(files, label):
+        if not files: raise FileNotFoundError(f"No files in {label}")
+        img = Image.open(files[0])
+        print(f"  {label}[0] PIL size: {img.size}  (width, height)")
+        return img.size  # (width, height)
 
-    print(f"Allocating HD volume {HZ}x{HY}x{HX} ...")
-    vol   = np.zeros((HZ, HY, HX), dtype=np.float32)
-    count = np.zeros((HZ, HY, HX), dtype=np.uint8)
+    fhd_w, fhd_h = check_size(front_hd_files, "FrontHD")  # expect (HD, HD)
+    thd_w, thd_h = check_size(top_files,       "TopHD")    # expect (HD*?, HZ*?)
+    rhd_w, rhd_h = check_size(right_files,     "RightHD")  # expect (HD*?, HZ*?)
 
-    # FrontHD: vol[hz, hy, hx] at even Z positions
-    # Each FrontHD image is HX wide x HY tall
+    # HD volume dimensions — derive from actual file sizes
+    # FrontHD: arr shape (fhd_h, fhd_w) = (HY, HX)
+    HX = fhd_w   # horizontal in front slice = X axis
+    HY = fhd_h   # vertical in front slice   = Y axis
+    # TopHD: arr shape (thd_h, thd_w) = (HZ, HX)  → HZ from height
+    HZ_from_top = thd_h
+    # RightHD: arr shape (rhd_h, rhd_w) = (HZ, HY)
+    HZ_from_right = rhd_h
+    HZ_actual = max(HZ_from_top, HZ_from_right, HZ)
+
+    print(f"HD volume: HZ={HZ_actual}, HY={HY}, HX={HX}")
+    print(f"  (from FrontHD: HX={HX}, HY={HY})")
+    print(f"  (from TopHD height: {HZ_from_top}, RightHD height: {HZ_from_right}, constant HZ: {HZ})")
+
+    vol   = np.zeros((HZ_actual, HY, HX), dtype=np.float32)
+    count = np.zeros((HZ_actual, HY, HX), dtype=np.uint8)
+
+    # ── Load FrontHD at even Z ────────────────────────────────────────────────
+    # arr shape: (HY, HX)  → vol[hz, hy, hx]
     print(f"Loading FrontHD ({len(front_hd_files)} slices)...")
     for n, f in enumerate(front_hd_files):
         hz = n * 2
-        if hz >= HZ: break
+        if hz >= HZ_actual: break
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
-        # arr shape: (HY, HX)
-        vol[hz, :, :] += arr
-        count[hz, :, :] += 1
+        if arr.shape != (HY, HX):
+            arr = np.array(Image.open(f).convert("L").resize((HX, HY), Image.LANCZOS), dtype=np.float32)
+        vol[hz, :, :] = arr
+        count[hz, :, :] = 1
 
-    # TopHD: image[ld_y] has shape (HX wide, HZ tall) after upscale
-    # axes: horizontal=hx, vertical=hz
-    # placed at even Y positions: vol[:, hy, :] where hy = ld_y * 2
+    # ── Load TopHD at even Y ──────────────────────────────────────────────────
+    # TopHD[ld_y]: PIL size (thd_w, thd_h), arr shape (thd_h, thd_w) = (HZ, HX)
+    # maps to vol[:, hy, :] where hy = ld_y * 2
     print(f"Loading TopHD ({len(top_files)} slices)...")
     for ld_y, f in enumerate(top_files):
         hy = ld_y * 2
         if hy >= HY: break
         img = Image.open(f).convert("L")
-        arr = np.array(img, dtype=np.float32)
-        # arr shape: (HZ, HX)  height=HZ, width=HX
-        if arr.shape != (HZ, HX):
-            img = img.resize((HX, HZ), Image.LANCZOS)
+        arr = np.array(img, dtype=np.float32)  # shape (thd_h, thd_w)
+        # Need shape (HZ_actual, HX)
+        if arr.shape != (HZ_actual, HX):
+            img = img.resize((HX, HZ_actual), Image.LANCZOS)
             arr = np.array(img, dtype=np.float32)
-        mask = count[:, hy, :] == 0
-        vol[:, hy, :][mask] += arr[mask]
-        count[:, hy, :][mask] += 1
+        # Only fill zeros (FrontHD has priority)
+        mask = count[:, hy, :] == 0   # shape (HZ_actual, HX)
+        vol[:, hy, :][mask] = arr[mask]
+        count[:, hy, :][mask] = 1
 
-    # RightHD: image[ld_x] has shape (HY wide, HZ tall) after upscale
-    # axes: horizontal=hy, vertical=hz
-    # placed at even X positions: vol[:, :, hx] where hx = ld_x * 2
+    # ── Load RightHD at even X ────────────────────────────────────────────────
+    # RightHD[ld_x]: PIL size (rhd_w, rhd_h), arr shape (rhd_h, rhd_w) = (HZ, HY)
+    # maps to vol[:, :, hx] where hx = ld_x * 2
     print(f"Loading RightHD ({len(right_files)} slices)...")
     for ld_x, f in enumerate(right_files):
         hx = ld_x * 2
         if hx >= HX: break
         img = Image.open(f).convert("L")
-        arr = np.array(img, dtype=np.float32)
-        # arr shape: (HZ, HY)
-        if arr.shape != (HZ, HY):
-            img = img.resize((HY, HZ), Image.LANCZOS)
+        arr = np.array(img, dtype=np.float32)  # shape (rhd_h, rhd_w)
+        # Need shape (HZ_actual, HY)
+        if arr.shape != (HZ_actual, HY):
+            img = img.resize((HY, HZ_actual), Image.LANCZOS)
             arr = np.array(img, dtype=np.float32)
-        mask = count[:, :, hx] == 0
-        vol[:, :, hx][mask] += arr[mask]
-        count[:, :, hx][mask] += 1
+        mask = count[:, :, hx] == 0   # shape (HZ_actual, HY)
+        vol[:, :, hx][mask] = arr[mask]
+        count[:, :, hx][mask] = 1
 
-    print("Averaging accumulated samples...")
-    filled = count > 0
-    vol[filled] /= count[filled].astype(np.float32)
-
-    # Estimate all-odd voxels from 6 neighbors
+    # ── Estimate all-odd voxels from 6 neighbors ──────────────────────────────
     print("Estimating unknowns (all-odd coordinates)...")
-    odd_z = np.arange(1, HZ - 1, 2)
+    odd_z = np.arange(1, HZ_actual - 1, 2)
     odd_y = np.arange(1, HY - 1, 2)
     odd_x = np.arange(1, HX - 1, 2)
     gz, gy, gx = np.meshgrid(odd_z, odd_y, odd_x, indexing='ij')
@@ -204,14 +266,18 @@ def step_build_frontmod2hd(base: Path):
     ], axis=0)
     vol[gz, gy, gx] = neighbors.mean(axis=0)
 
-    # Extract interleaved slices at odd Z, shrink then re-upscale
+    # ── Extract interleaved slices at odd Z, shrink → re-upscale ─────────────
     print("Extracting interleaved slices (shrink → re-upscale)...")
     for n in range(TARGET_DEPTH):
         out_path = out_dir / f"{n:04d}.png"
         if out_path.exists():
             continue
         hz = n * 2 + 1
-        slice_hd = volume_to_image(vol[hz, :, :])  # HX x HY
+        if hz >= HZ_actual:
+            Image.new("L", (HD, HD), 0).save(out_path)
+            continue
+
+        slice_hd = volume_to_image(vol[hz, :, :])  # PIL size (HX, HY)
 
         if is_black_image(slice_hd):
             Image.new("L", (HD, HD), 0).save(out_path)
@@ -268,16 +334,16 @@ def main():
     raw_slices = load_slices(front_ld)
     print(f"  Found {len(raw_slices)} slices, padding to {TARGET_DEPTH}")
     if raw_slices:
-        print(f"  Slice size: {raw_slices[0].size}")
+        print(f"  Slice size after resize: {raw_slices[0].size}")
 
     padded = pad_to_depth(raw_slices, TARGET_DEPTH)
     vol    = slices_to_volume(padded)
     print(f"  Volume shape: {vol.shape}")  # (TARGET_DEPTH, SLICE_SIZE, SLICE_SIZE)
 
-    # Save padded FrontLD if needed
+    # Save padded FrontLD if count changed
     existing = sorted(front_ld.glob("*.png"))
     if len(existing) != TARGET_DEPTH:
-        print("Saving padded FrontLD slices...")
+        print(f"Saving padded FrontLD slices ({len(existing)} → {TARGET_DEPTH})...")
         for i, s in enumerate(padded):
             s.save(front_ld / f"{i:04d}.png")
 
