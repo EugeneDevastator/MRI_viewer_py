@@ -1,9 +1,6 @@
 """
-mriup.py
-Usage: python mriup.py <folder_containing_FrontLD>
-
-Expects FrontLD/ with PNG slices named in sorted order.
-Produces: TopLD/ RightLD/ FrontHD/ TopHD/ RightHD/ FrontMod2HD/ FrontCompleteHD/
+mriupgpu.py
+Usage: python mriupgpu.py <folder_containing_FrontLD>
 """
 
 import sys
@@ -102,9 +99,16 @@ def step_upscale_all(base: Path):
         print(f"Upscaling {name} → {dst.name} ...")
         upscale_folder(src, dst)
 
+
 def step_build_frontmod2hd(base: Path):
     out_dir = base / "FrontMod2HD"
     ensure(out_dir)
+
+    # Check if already done
+    existing = sorted(out_dir.glob("*.png"))
+    if len(existing) == TARGET_DEPTH:
+        print("FrontMod2HD exists, skipping")
+        return
 
     front_hd_files = sorted((base / "FrontHD").glob("*.png"))
     top_files      = sorted((base / "TopHD").glob("*.png"))
@@ -131,8 +135,10 @@ def step_build_frontmod2hd(base: Path):
         hy = ld_y * 2
         if hy >= HD: break
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
-        vol[:, hy, :] += arr
-        count[:, hy, :] += 1
+        # only fill zeros (FrontHD has priority)
+        mask = count[:, hy, :] == 0
+        vol[:, hy, :][mask] += arr[mask]
+        count[:, hy, :][mask] += 1
 
     # RightHD: image[ld_x] axes=(hz, hy), placed at even X positions
     print(f"Loading RightHD ({len(right_files)} slices)...")
@@ -140,16 +146,17 @@ def step_build_frontmod2hd(base: Path):
         hx = ld_x * 2
         if hx >= HD: break
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
-        vol[:, :, hx] += arr
-        count[:, :, hx] += 1
+        # only fill zeros (FrontHD and TopHD have priority)
+        mask = count[:, :, hx] == 0
+        vol[:, :, hx][mask] += arr[mask]
+        count[:, :, hx][mask] += 1
 
     print("Averaging accumulated samples...")
     filled_mask = count > 0
     vol[filled_mask] /= count[filled_mask].astype(np.float32)
 
-    # Unknown voxels are at all-odd coordinates: (odd_z, odd_y, odd_x)
-    # Their 6 neighbors are all at positions with exactly one coord differing by 1,
-    # which lands on even coords — guaranteed filled.
+    # Unknown voxels: all-odd coordinates (odd_z, odd_y, odd_x)
+    # 6 neighbors are all at even coords — guaranteed filled
     print("Estimating unknowns (all-odd coordinates, vectorized)...")
     odd = np.arange(1, HD - 1, 2)  # 1,3,5,...,509
     gz, gy, gx = np.meshgrid(odd, odd, odd, indexing='ij')
@@ -167,16 +174,30 @@ def step_build_frontmod2hd(base: Path):
     ], axis=0)
     vol[gz, gy, gx] = neighbors.mean(axis=0)
 
-    print("Extracting interleaved slices (odd Z positions)...")
+    # Extract interleaved slices (odd Z positions) — these are 512x512
+    # Shrink to 256x256 (removes interpolation artifacts), then upscale back to 512x512
+    print("Extracting, shrink-then-reupscale interleaved slices...")
     for n in range(TARGET_DEPTH):
         out_path = out_dir / f"{n:04d}.png"
         if out_path.exists():
             continue
         hz = n * 2 + 1
-        volume_to_image(vol[hz, :, :]).save(out_path)
+        slice_512 = volume_to_image(vol[hz, :, :])  # 512x512
+
+        if is_black_image(slice_512):
+            Image.new("L", (SLICE_SIZE * 2, SLICE_SIZE * 2), 0).save(out_path)
+        else:
+            # Shrink to 256x256 — averages out interpolation artifacts
+            slice_256 = slice_512.resize((SLICE_SIZE, SLICE_SIZE), Image.LANCZOS)
+            # Upscale back to 512x512 with neural upscaler — restores detail cleanly
+            reales4u2d(slice_256).save(out_path)
+
+        if n % 20 == 0:
+            print(f"  slice {n}/{TARGET_DEPTH}")
 
     print(f"FrontMod2HD: {TARGET_DEPTH} slices done")
-    
+
+
 def step_combine(base: Path):
     out_dir = base / "FrontCompleteHD"
     ensure(out_dir)
@@ -204,7 +225,7 @@ def step_combine(base: Path):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python mriup.py <folder>")
+        print("Usage: python mriupgpu.py <folder>")
         sys.exit(1)
 
     base = Path(sys.argv[1])
