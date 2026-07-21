@@ -126,8 +126,10 @@ def step_build_frontmod2hd(base: Path):
 
     print(f"Loading TopHD ({len(top_files)} slices)...")
     for ld_y, f in enumerate(top_files):
+        
         hy = ld_y * 2
         if hy >= HD: break
+        hy -= 1
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
         vol[:, hy, :] += arr
         count[:, hy, :] += 1
@@ -136,6 +138,7 @@ def step_build_frontmod2hd(base: Path):
     for ld_x, f in enumerate(right_files):
         hx = ld_x * 2
         if hx >= HD: break
+        hx -=1
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
         vol[:, :, hx] += arr
         count[:, :, hx] += 1
@@ -171,7 +174,7 @@ def step_build_frontmod2hd(base: Path):
         filled_mask[has_neighbors]  = True
 
     print("Extracting interleaved slices...")
-    num_interleaved = TARGET_DEPTH - 1
+    num_interleaved = TARGET_DEPTH
     for n in range(num_interleaved):
         out_path = out_dir / f"{n:04d}.png"
         if out_path.exists():
