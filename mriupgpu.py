@@ -3,36 +3,29 @@ mriup.py
 Usage: python mriup.py <folder_containing_FrontLD>
 
 Expects FrontLD/ with PNG slices named in sorted order.
-Produces: TopLD/ RightLD/ FrontHD/ TopHD/ RightHD/ FrontMod2LD/ FrontMod2HD/ FrontCompleteHD/
+Produces: TopLD/ RightLD/ FrontHD/ TopHD/ RightHD/ FrontMod2HD/ FrontCompleteHD/
 """
 
 import sys
 from pathlib import Path
 import numpy as np
 from PIL import Image
-import torch
 
 from reales4u2d import load_model, reales4u2d
 
 TARGET_DEPTH = 256
 SLICE_SIZE   = 256
 
-# ── device detection ──────────────────────────────────────────────────────────
-
-
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def ensure(folder: Path):
     folder.mkdir(parents=True, exist_ok=True)
 
-def load_slices(folder: Path) -> list[Image.Image]:
+def load_slices(folder: Path) -> list:
     files = sorted(folder.glob("*.png"))
     return [Image.open(f).convert("L") for f in files]
 
-def save_slice(img: Image.Image, folder: Path, name: str):
-    img.save(folder / name)
-
-def pad_to_depth(slices: list[Image.Image], depth: int) -> list[Image.Image]:
+def pad_to_depth(slices: list, depth: int) -> list:
     n = len(slices)
     if n >= depth:
         return slices[:depth]
@@ -42,7 +35,7 @@ def pad_to_depth(slices: list[Image.Image], depth: int) -> list[Image.Image]:
     black = Image.new("L", (SLICE_SIZE, SLICE_SIZE), 0)
     return [black] * pad_before + slices + [black] * pad_after
 
-def slices_to_volume(slices: list[Image.Image]) -> np.ndarray:
+def slices_to_volume(slices: list) -> np.ndarray:
     return np.stack([np.array(s, dtype=np.float32) for s in slices], axis=0)
 
 def volume_to_image(arr2d: np.ndarray) -> Image.Image:
@@ -52,7 +45,6 @@ def is_black_image(img: Image.Image) -> bool:
     return np.array(img).sum() == 0
 
 def upscale_folder(src: Path, dst: Path):
-    """Upscale per-image, skip already done."""
     ensure(dst)
     files = sorted(src.glob("*.png"))
     for f in files:
@@ -68,11 +60,11 @@ def upscale_folder(src: Path, dst: Path):
 
 # ── axis mapping ──────────────────────────────────────────────────────────────
 # vol[Z, Y, X]
-# FrontLD[Z] → vol[Z, :, :]   X=horizontal, Y=vertical
-# TopLD[Y]   → vol[:, Y, :]   X=horizontal, Z=vertical
-# RightLD[X] → vol[:, :, X]   Y=horizontal, Z=vertical
+# FrontLD[Z] → vol[Z, :, :]   image axes: horizontal=X, vertical=Y
+# TopLD[Y]   → vol[:, Y, :]   image axes: horizontal=X, vertical=Z
+# RightLD[X] → vol[:, :, X]   image axes: horizontal=Y, vertical=Z
 #
-# After 2x upscale, original slice Z maps to pixel-Z = Z*2
+# HD images are 512x512. Original slice Z → pixel-Z = Z*2 in HD space.
 # Interleaved slice between Z=n and Z=n+1 → pixel-Z = n*2+1
 
 # ── pipeline steps ────────────────────────────────────────────────────────────
@@ -85,6 +77,7 @@ def step_generate_top_right(base: Path, vol: np.ndarray):
     if not top_dir.exists():
         ensure(top_dir)
         for y in range(Y):
+            # TopLD[y]: horizontal=X, vertical=Z → vol[:, y, :] shape (Z, X)
             volume_to_image(vol[:, y, :]).save(top_dir / f"{y:04d}.png")
         print(f"TopLD generated: {Y} slices")
     else:
@@ -93,6 +86,7 @@ def step_generate_top_right(base: Path, vol: np.ndarray):
     if not right_dir.exists():
         ensure(right_dir)
         for x in range(X):
+            # RightLD[x]: horizontal=Y, vertical=Z → vol[:, :, x] shape (Z, Y)
             volume_to_image(vol[:, :, x]).save(right_dir / f"{x:04d}.png")
         print(f"RightLD generated: {X} slices")
     else:
@@ -107,42 +101,35 @@ def step_upscale_all(base: Path):
         upscale_folder(src, dst)
 
 
-def step_build_frontmod2ld(base: Path):
-    out_dir = base / "FrontMod2LD"
-    ensure(out_dir)
-
-    top_files   = sorted((base / "TopHD").glob("*.png"))
-    right_files = sorted((base / "RightHD").glob("*.png"))
-
-    print("Loading TopHD and RightHD into memory...")
-    top_hd   = [np.array(Image.open(f).convert("L"), dtype=np.float32) for f in top_files]
-    right_hd = [np.array(Image.open(f).convert("L"), dtype=np.float32) for f in right_files]
-
-    num_Y = len(top_hd)
-    num_X = len(right_hd)
-    num_interleaved = TARGET_DEPTH - 1
-
-    for n in range(num_interleaved):
-        out_path = out_dir / f"{n:04d}.png"
-        if out_path.exists():
-            continue
-
-        pz = n * 2 + 1
-
-        # TopHD[Y][pz, x*2] → top_contrib[Y, X]
-        top_contrib = np.zeros((num_Y, num_X), dtype=np.float32)
-        for y in range(num_Y):
-            top_contrib[y, :] = top_hd[y][pz, 0::2]
-
-        # RightHD[X][pz, y*2] → right_contrib[Y, X]
-        right_contrib = np.zeros((num_Y, num_X), dtype=np.float32)
-        for x in range(num_X):
-            right_contrib[:, x] = right_hd[x][pz, 0::2]
-
-        volume_to_image((top_contrib + right_contrib) / 2.0).save(out_path)
-
-    print(f"FrontMod2LD: {num_interleaved} slices")
 def step_build_frontmod2hd(base: Path):
+    """
+    Build interleaved front slices directly in HD space (512x512).
+
+    For interleaved slice between Z=n and Z=n+1, pixel-Z in HD = n*2+1.
+    Each 2x2 block at LD position (x, y) maps to HD pixels:
+
+        (px, py)     = (x*2,   y*2)
+        (px+1, py)   = (x*2+1, y*2)
+        (px,   py+1) = (x*2,   y*2+1)
+        (px+1, py+1) = (x*2+1, y*2+1)
+
+    Known pixels:
+        (px,   py)   = avg(TopHD[y*2][pz, x*2],   RightHD[x*2][pz, y*2])
+        (px+1, py)   = TopHD[y*2][pz, x*2+1]
+        (px,   py+1) = RightHD[x*2][pz, y*2+1]
+
+    Unknown pixel (px+1, py+1): estimated from 6 neighbors:
+        - FrontHD[n]   [py+1, px+1]  (Z-)
+        - FrontHD[n+1] [py+1, px+1]  (Z+)
+        - TopHD[y*2-1] [pz,   px+1]  (Y-)  clamped
+        - TopHD[y*2+1] [pz,   px+1]  (Y+)  clamped
+        - RightHD[x*2-1][pz,  py+1]  (X-)  clamped
+        - RightHD[x*2+1][pz,  py+1]  (X+)  clamped
+
+    TopHD has num_Y=256 files (LD Y rows), each 512x512.
+    RightHD has num_X=256 files (LD X cols), each 512x512.
+    FrontHD has TARGET_DEPTH=256 files, each 512x512.
+    """
     out_dir = base / "FrontMod2HD"
     ensure(out_dir)
 
@@ -150,66 +137,85 @@ def step_build_frontmod2hd(base: Path):
     top_files      = sorted((base / "TopHD").glob("*.png"))
     right_files    = sorted((base / "RightHD").glob("*.png"))
 
-    print("Loading TopHD and RightHD into memory...")
-    top_hd   = [np.array(Image.open(f).convert("L"), dtype=np.float32) for f in top_files]
-    right_hd = [np.array(Image.open(f).convert("L"), dtype=np.float32) for f in right_files]
-    front_hd = [np.array(Image.open(f).convert("L"), dtype=np.float32) for f in front_hd_files]
+    num_Y = len(top_files)    # = SLICE_SIZE = 256  (one file per LD Y row)
+    num_X = len(right_files)  # = SLICE_SIZE = 256  (one file per LD X col)
+    HD    = SLICE_SIZE * 2    # 512
 
-    num_Y = len(top_hd)    # 512
-    num_X = len(right_hd)  # 512
-    HD = SLICE_SIZE * 2    # 512
+    print(f"Loading TopHD ({num_Y} files) and RightHD ({num_X} files) into memory...")
+    # top_hd[y]  shape (512, 512): axis0=Z(HD), axis1=X(HD)
+    top_hd   = np.stack([np.array(Image.open(f).convert("L"), dtype=np.float32)
+                         for f in top_files],   axis=0)  # (num_Y, 512, 512)
+    # right_hd[x] shape (512, 512): axis0=Z(HD), axis1=Y(HD)
+    right_hd = np.stack([np.array(Image.open(f).convert("L"), dtype=np.float32)
+                         for f in right_files], axis=0)  # (num_X, 512, 512)
+
+    print(f"Loading FrontHD ({len(front_hd_files)} files) into memory...")
+    front_hd = np.stack([np.array(Image.open(f).convert("L"), dtype=np.float32)
+                         for f in front_hd_files], axis=0)  # (TARGET_DEPTH, 512, 512)
+
     num_interleaved = TARGET_DEPTH - 1
 
-    def clamp(v, lo, hi):
-        return max(lo, min(hi, v))
+    # Precompute index arrays for vectorized pixel picking
+    # LD coordinate grids
+    ys = np.arange(SLICE_SIZE)  # 0..255
+    xs = np.arange(SLICE_SIZE)  # 0..255
+    # HD coordinate grids (meshgrid: Y varies along axis0, X along axis1)
+    Y_ld, X_ld = np.meshgrid(ys, xs, indexing='ij')  # both shape (256, 256)
+
+    py = Y_ld * 2   # HD Y coords of even rows
+    px = X_ld * 2   # HD X coords of even cols
+
+    # Neighbor indices for unknown pixel (px+1, py+1), clamped to [0, num_Y/X - 1]
+    ty_lo = np.clip(Y_ld - 1, 0, num_Y - 1)   # TopHD Y- neighbor (LD index)
+    ty_hi = np.clip(Y_ld + 1, 0, num_Y - 1)   # TopHD Y+ neighbor (LD index)
+    rx_lo = np.clip(X_ld - 1, 0, num_X - 1)   # RightHD X- neighbor (LD index)
+    rx_hi = np.clip(X_ld + 1, 0, num_X - 1)   # RightHD X+ neighbor (LD index)
 
     for n in range(num_interleaved):
         out_path = out_dir / f"{n:04d}.png"
         if out_path.exists():
+            if n % 20 == 0:
+                print(f"  FrontMod2HD: {n}/{num_interleaved} (skip)")
             continue
 
         pz = n * 2 + 1
         out = np.zeros((HD, HD), dtype=np.float32)
 
-        for y in range(SLICE_SIZE):
-            for x in range(SLICE_SIZE):
-                py0 = y * 2
-                px0 = x * 2
+        # ── Known pixels ──────────────────────────────────────────────────────
 
-                T = top_hd[py0][pz, px0]
-                R = right_hd[px0][pz, py0]
-                out[py0,     px0]     = (T + R) / 2.0
-                out[py0,     px0 + 1] = top_hd[py0][pz, px0 + 1]
-                out[py0 + 1, px0]     = right_hd[px0][pz, py0 + 1]
+        # (px, py): avg of TopHD[y*2][pz, x*2] and RightHD[x*2][pz, y*2]
+        T_corner = top_hd[Y_ld * 2, pz, X_ld * 2]       # shape (256,256)
+        R_corner = right_hd[X_ld * 2, pz, Y_ld * 2]     # shape (256,256)
+        out[py, px] = (T_corner + R_corner) / 2.0
 
-                # 6-neighbor estimate for unknown corner
-                neighbors = []
-                # Z neighbors from FrontHD
-                neighbors.append(front_hd[n    ][py0 + 1, px0 + 1])
-                neighbors.append(front_hd[n + 1][py0 + 1, px0 + 1])
-                # Y neighbors from TopHD (adjacent HD rows)
-                ty_lo = clamp(py0 - 1, 0, HD - 1)
-                ty_hi = clamp(py0 + 2, 0, HD - 1)
-                neighbors.append(top_hd[ty_lo][pz, px0 + 1])
-                neighbors.append(top_hd[ty_hi][pz, px0 + 1])
-                # X neighbors from RightHD (adjacent HD cols)
-                rx_lo = clamp(px0 - 1, 0, HD - 1)
-                rx_hi = clamp(px0 + 2, 0, HD - 1)
-                neighbors.append(right_hd[rx_lo][pz, py0 + 1])
-                neighbors.append(right_hd[rx_hi][pz, py0 + 1])
+        # (px+1, py): TopHD[y*2][pz, x*2+1]
+        out[py, px + 1] = top_hd[Y_ld * 2, pz, X_ld * 2 + 1]
 
-                out[py0 + 1, px0 + 1] = sum(neighbors) / len(neighbors)
+        # (px, py+1): RightHD[x*2][pz, y*2+1]
+        out[py + 1, px] = right_hd[X_ld * 2, pz, Y_ld * 2 + 1]
+
+        # ── Unknown pixel (px+1, py+1): 6-neighbor average ───────────────────
+
+        # Z- neighbor: FrontHD[n][py+1, px+1]
+        n0 = front_hd[n,     py + 1, px + 1]
+        # Z+ neighbor: FrontHD[n+1][py+1, px+1]
+        n1 = front_hd[n + 1, py + 1, px + 1]
+        # Y- neighbor: TopHD[ty_lo][pz, px+1]
+        n2 = top_hd[ty_lo * 2, pz, px + 1]
+        # Y+ neighbor: TopHD[ty_hi][pz, px+1]
+        n3 = top_hd[ty_hi * 2, pz, px + 1]
+        # X- neighbor: RightHD[rx_lo][pz, py+1]
+        n4 = right_hd[rx_lo * 2, pz, py + 1]
+        # X+ neighbor: RightHD[rx_hi][pz, py+1]
+        n5 = right_hd[rx_hi * 2, pz, py + 1]
+
+        out[py + 1, px + 1] = (n0 + n1 + n2 + n3 + n4 + n5) / 6.0
 
         volume_to_image(out).save(out_path)
         if n % 20 == 0:
             print(f"  FrontMod2HD: {n}/{num_interleaved}")
 
-    print(f"FrontMod2HD: {num_interleaved} slices")
-
-
-def step_upscale_frontmod2(base: Path):
-    print("Upscaling FrontMod2LD → FrontMod2HD ...")
-    upscale_folder(base / "FrontMod2LD", base / "FrontMod2HD")
+    print(f"FrontMod2HD: {num_interleaved} slices done")
 
 
 def step_combine(base: Path):
@@ -271,9 +277,7 @@ def main():
 
     step_generate_top_right(base, vol)
     step_upscale_all(base)
-    step_build_frontmod2hd(base) #just estimate missing 1/8 pixel
-    #step_build_frontmod2ld(base) #old passes trying to upscale
-    #step_upscale_frontmod2(base)
+    step_build_frontmod2hd(base)
     step_combine(base)
 
     print("Done.")
