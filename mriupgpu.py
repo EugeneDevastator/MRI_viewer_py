@@ -138,9 +138,13 @@ def step_build_frontmod2hd(base: Path):
         hx = ld_x * 2
         if hx >= HD: break
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
-        mask = filled[:, :, hx] == 0
-        vol[:, :, hx][mask] = arr[mask]
-        filled[:, :, hx][mask] = 1
+        # average where already filled by TopHD, overwrite where empty
+        already = filled[:, :, hx] == 1
+        empty   = filled[:, :, hx] == 0
+        vol[:, :, hx][already] = (vol[:, :, hx][already] + arr[already]) * 0.5
+        vol[:, :, hx][empty]   = arr[empty]
+        filled[:, :, hx][empty] = 1
+
 
     print("Estimating unknowns (vectorized)...")
 
