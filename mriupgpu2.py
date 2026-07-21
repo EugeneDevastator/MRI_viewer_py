@@ -201,8 +201,11 @@ def step_build_frontmod2hd(base: Path):
     vol   = np.zeros((HZ_actual, HY, HX), dtype=np.float32)
     count = np.zeros((HZ_actual, HY, HX), dtype=np.uint8)
 
-    # ── Load FrontHD at even Z ────────────────────────────────────────────────
-    # arr shape: (HY, HX)  → vol[hz, hy, hx]
+    # Use float accumulator for proper averaging
+    accum = np.zeros((HZ_actual, HY, HX), dtype=np.float32)
+    count = np.zeros((HZ_actual, HY, HX), dtype=np.uint8)
+
+    # Load FrontHD at even Z
     print(f"Loading FrontHD ({len(front_hd_files)} slices)...")
     for n, f in enumerate(front_hd_files):
         hz = n * 2
@@ -210,43 +213,38 @@ def step_build_frontmod2hd(base: Path):
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
         if arr.shape != (HY, HX):
             arr = np.array(Image.open(f).convert("L").resize((HX, HY), Image.LANCZOS), dtype=np.float32)
-        vol[hz, :, :] = arr
-        count[hz, :, :] = 1
+        accum[hz, :, :] += arr
+        count[hz, :, :] += 1
 
-    # ── Load TopHD at even Y ──────────────────────────────────────────────────
-    # TopHD[ld_y]: PIL size (thd_w, thd_h), arr shape (thd_h, thd_w) = (HZ, HX)
-    # maps to vol[:, hy, :] where hy = ld_y * 2
+    # Load TopHD at even Y — accumulate (no priority mask)
     print(f"Loading TopHD ({len(top_files)} slices)...")
     for ld_y, f in enumerate(top_files):
         hy = ld_y * 2
         if hy >= HY: break
         img = Image.open(f).convert("L")
-        arr = np.array(img, dtype=np.float32)  # shape (thd_h, thd_w)
-        # Need shape (HZ_actual, HX)
+        arr = np.array(img, dtype=np.float32)
         if arr.shape != (HZ_actual, HX):
-            img = img.resize((HX, HZ_actual), Image.LANCZOS)
-            arr = np.array(img, dtype=np.float32)
-        # Only fill zeros (FrontHD has priority)
-        mask = count[:, hy, :] == 0   # shape (HZ_actual, HX)
-        vol[:, hy, :][mask] = arr[mask]
-        count[:, hy, :][mask] = 1
+            arr = np.array(img.resize((HX, HZ_actual), Image.LANCZOS), dtype=np.float32)
+        accum[:, hy, :] += arr
+        count[:, hy, :] += 1
 
-    # ── Load RightHD at even X ────────────────────────────────────────────────
-    # RightHD[ld_x]: PIL size (rhd_w, rhd_h), arr shape (rhd_h, rhd_w) = (HZ, HY)
-    # maps to vol[:, :, hx] where hx = ld_x * 2
+    # Load RightHD at even X — accumulate
     print(f"Loading RightHD ({len(right_files)} slices)...")
     for ld_x, f in enumerate(right_files):
         hx = ld_x * 2
         if hx >= HX: break
         img = Image.open(f).convert("L")
-        arr = np.array(img, dtype=np.float32)  # shape (rhd_h, rhd_w)
-        # Need shape (HZ_actual, HY)
+        arr = np.array(img, dtype=np.float32)
         if arr.shape != (HZ_actual, HY):
-            img = img.resize((HY, HZ_actual), Image.LANCZOS)
-            arr = np.array(img, dtype=np.float32)
-        mask = count[:, :, hx] == 0   # shape (HZ_actual, HY)
-        vol[:, :, hx][mask] = arr[mask]
-        count[:, :, hx][mask] = 1
+            arr = np.array(img.resize((HY, HZ_actual), Image.LANCZOS), dtype=np.float32)
+        accum[:, :, hx] += arr
+        count[:, :, hx] += 1
+
+    # Average where multiple sources overlap
+    filled = count > 0
+    vol = np.zeros((HZ_actual, HY, HX), dtype=np.float32)
+    vol[filled] = accum[filled] / count[filled]
+
 
     # ── Estimate all-odd voxels from 6 neighbors ──────────────────────────────
     print("Estimating unknowns (all-odd coordinates)...")
