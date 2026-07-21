@@ -138,11 +138,8 @@ def step_build_frontmod2hd(base: Path):
         hx = ld_x * 2
         if hx >= HD: break
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
-        # average where already filled by TopHD, overwrite where empty
-        already = filled[:, :, hx] == 1
-        empty   = filled[:, :, hx] == 0
-        vol[:, :, hx][already] = (vol[:, :, hx][already] + arr[already]) * 0.5
-        vol[:, :, hx][empty]   = arr[empty]
+        empty = filled[:, :, hx] == 0
+        vol[:, :, hx][empty] = arr[empty]
         filled[:, :, hx][empty] = 1
 
 
