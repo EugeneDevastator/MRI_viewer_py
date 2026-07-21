@@ -20,31 +20,57 @@ _device = None
 
 
 def get_device():
+    print(f"  PyTorch version: {torch.version}")
+    print(f"  CUDA built-in version: {torch.version.cuda}")
+    print(f"  CUDA available: {torch.cuda.is_available()}")
+
     if torch.cuda.is_available():
-        # Pick highest VRAM GPU (handles dual-GPU laptops)
-        best = max(range(torch.cuda.device_count()),
+        count = torch.cuda.device_count()
+        print(f"  CUDA device count: {count}")
+        for i in range(count):
+            props = torch.cuda.get_device_properties(i)
+            vram_mb = props.total_memory // (1024 * 1024)
+            print(f"    [{i}] {props.name} — {vram_mb} MB VRAM")
+        best = max(range(count),
                    key=lambda i: torch.cuda.get_device_properties(i).total_memory)
         dev = torch.device(f"cuda:{best}")
-        print(f"GPU: {torch.cuda.get_device_name(best)}")
+        print(f"  Selected: cuda:{best} ({torch.cuda.get_device_name(best)})")
         return dev
+    else:
+        print("  CUDA not available — possible causes:")
+        print("    - PyTorch installed without CUDA (cpu-only build)")
+        print("    - CUDA toolkit version mismatch")
+        print("    - Run: python -c \"import torch; print(torch.version)\"")
+        print("    - Check if torch was installed via: pip install torch (cpu) vs pip install torch --index-url https://download.pytorch.org/whl/cu121")
+
     try:
         import torch_directml
-        dev = torch_directml.device()
-        print(f"GPU: DirectML (AMD/Intel)")
+        dml_count = torch_directml.device_count()
+        print(f"  DirectML device count: {dml_count}")
+        for i in range(dml_count):
+            print(f"    [{i}] {torch_directml.device_name(i)}")
+        dev = torch_directml.device(0)
+        print(f"  Selected: DirectML device 0")
         return dev
     except ImportError:
-        pass
-    print("GPU: not found, using CPU")
+        print("  DirectML: not installed (pip install torch-directml)")
+    except Exception as e:
+        print(f"  DirectML error: {e}")
+
+    print("  Falling back to CPU")
     return torch.device("cpu")
 
 
 def load_model():
     global _model, _device
     if _model is None:
+        print("Detecting compute device...")
         _device = get_device()
+        print(f"Loading model from: {MODEL_PATH}")
         _model = spandrel.ModelLoader().load_from_file(str(MODEL_PATH))
         _model.eval()
         _model.to(_device)
+        print(f"Model loaded and ready on {_device}")
     return _model, _device
 
 

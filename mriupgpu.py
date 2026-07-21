@@ -19,23 +19,6 @@ SLICE_SIZE   = 256
 
 # ── device detection ──────────────────────────────────────────────────────────
 
-def detect_device() -> str:
-    if torch.cuda.is_available():
-        # Pick highest VRAM GPU
-        best = max(range(torch.cuda.device_count()),
-                   key=lambda i: torch.cuda.get_device_properties(i).total_memory)
-        name = torch.cuda.get_device_properties(best).name
-        print(f"GPU selected: {name} (cuda:{best})")
-        return f"cuda:{best}"
-    try:
-        import torch_directml
-        device = torch_directml.device()
-        print(f"DirectML device selected (Radeon/integrated)")
-        return device
-    except ImportError:
-        pass
-    print("No GPU found, using CPU")
-    return "cpu"
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -202,9 +185,8 @@ def main():
         print(f"FrontLD not found in: {base}")
         sys.exit(1)
 
-    device = detect_device()
     print("Loading upscale model...")
-    load_model(device=device)
+    load_model()
 
     print(f"Loading FrontLD from {front_ld} ...")
     raw_slices = load_slices(front_ld)
