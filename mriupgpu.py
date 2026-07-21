@@ -116,6 +116,7 @@ def step_build_frontmod2hd(base: Path):
     vol   = np.zeros((HD, HD, HD), dtype=np.float32)
     count = np.zeros((HD, HD, HD), dtype=np.uint8)
 
+    # FrontHD: vol[hz, hy, hx], even Z positions
     print(f"Loading FrontHD ({len(front_hd_files)} slices)...")
     for n, f in enumerate(front_hd_files):
         hz = n * 2
@@ -124,21 +125,20 @@ def step_build_frontmod2hd(base: Path):
         vol[hz, :, :] += arr
         count[hz, :, :] += 1
 
+    # TopHD: image[ld_y] axes=(hz, hx), placed at even Y positions
     print(f"Loading TopHD ({len(top_files)} slices)...")
     for ld_y, f in enumerate(top_files):
-        
         hy = ld_y * 2
         if hy >= HD: break
-        hy -= 1
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
         vol[:, hy, :] += arr
         count[:, hy, :] += 1
 
+    # RightHD: image[ld_x] axes=(hz, hy), placed at even X positions
     print(f"Loading RightHD ({len(right_files)} slices)...")
     for ld_x, f in enumerate(right_files):
         hx = ld_x * 2
         if hx >= HD: break
-        hx -=1
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
         vol[:, :, hx] += arr
         count[:, :, hx] += 1
@@ -147,44 +147,36 @@ def step_build_frontmod2hd(base: Path):
     filled_mask = count > 0
     vol[filled_mask] /= count[filled_mask].astype(np.float32)
 
-    print("Estimating unknowns (vectorized)...")
-    for pass_num in range(4):
-        unfilled = ~filled_mask
-        n_unfilled = unfilled.sum()
-        if n_unfilled == 0:
-            break
-        print(f"  Pass {pass_num+1}: {n_unfilled} unfilled")
+    # Unknown voxels are at all-odd coordinates: (odd_z, odd_y, odd_x)
+    # Their 6 neighbors are all at positions with exactly one coord differing by 1,
+    # which lands on even coords — guaranteed filled.
+    print("Estimating unknowns (all-odd coordinates, vectorized)...")
+    odd = np.arange(1, HD - 1, 2)  # 1,3,5,...,509
+    gz, gy, gx = np.meshgrid(odd, odd, odd, indexing='ij')
+    gz = gz.ravel()
+    gy = gy.ravel()
+    gx = gx.ravel()
 
-        acc = np.zeros((HD, HD, HD), dtype=np.float32)
-        cnt = np.zeros((HD, HD, HD), dtype=np.float32)
+    neighbors = np.stack([
+        vol[gz-1, gy,   gx  ],
+        vol[gz+1, gy,   gx  ],
+        vol[gz,   gy-1, gx  ],
+        vol[gz,   gy+1, gx  ],
+        vol[gz,   gy,   gx-1],
+        vol[gz,   gy,   gx+1],
+    ], axis=0)
+    vol[gz, gy, gx] = neighbors.mean(axis=0)
 
-        vp = np.pad(vol,          1, mode='edge')
-        fp = np.pad(filled_mask.astype(np.float32), 1, mode='edge')
-
-        for dz, dy, dx in [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)]:
-            nz = slice(1+dz, HD+1+dz)
-            ny = slice(1+dy, HD+1+dy)
-            nx = slice(1+dx, HD+1+dx)
-            nf = fp[nz, ny, nx]
-            acc += vp[nz, ny, nx] * nf
-            cnt += nf
-
-        has_neighbors = (cnt > 0) & unfilled
-        vol[has_neighbors]          = acc[has_neighbors] / cnt[has_neighbors]
-        filled_mask[has_neighbors]  = True
-
-    print("Extracting interleaved slices...")
-    num_interleaved = TARGET_DEPTH
-    for n in range(num_interleaved):
+    print("Extracting interleaved slices (odd Z positions)...")
+    for n in range(TARGET_DEPTH):
         out_path = out_dir / f"{n:04d}.png"
         if out_path.exists():
             continue
         hz = n * 2 + 1
         volume_to_image(vol[hz, :, :]).save(out_path)
 
-    print(f"FrontMod2HD: {num_interleaved} slices done")
-
-
+    print(f"FrontMod2HD: {TARGET_DEPTH} slices done")
+    
 def step_combine(base: Path):
     out_dir = base / "FrontCompleteHD"
     ensure(out_dir)
