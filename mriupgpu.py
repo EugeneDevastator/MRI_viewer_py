@@ -142,6 +142,69 @@ def step_build_frontmod2ld(base: Path):
         volume_to_image((top_contrib + right_contrib) / 2.0).save(out_path)
 
     print(f"FrontMod2LD: {num_interleaved} slices")
+def step_build_frontmod2hd(base: Path):
+    out_dir = base / "FrontMod2HD"
+    ensure(out_dir)
+
+    front_hd_files = sorted((base / "FrontHD").glob("*.png"))
+    top_files      = sorted((base / "TopHD").glob("*.png"))
+    right_files    = sorted((base / "RightHD").glob("*.png"))
+
+    print("Loading TopHD and RightHD into memory...")
+    top_hd   = [np.array(Image.open(f).convert("L"), dtype=np.float32) for f in top_files]
+    right_hd = [np.array(Image.open(f).convert("L"), dtype=np.float32) for f in right_files]
+    front_hd = [np.array(Image.open(f).convert("L"), dtype=np.float32) for f in front_hd_files]
+
+    num_Y = len(top_hd)    # 512
+    num_X = len(right_hd)  # 512
+    HD = SLICE_SIZE * 2    # 512
+    num_interleaved = TARGET_DEPTH - 1
+
+    def clamp(v, lo, hi):
+        return max(lo, min(hi, v))
+
+    for n in range(num_interleaved):
+        out_path = out_dir / f"{n:04d}.png"
+        if out_path.exists():
+            continue
+
+        pz = n * 2 + 1
+        out = np.zeros((HD, HD), dtype=np.float32)
+
+        for y in range(SLICE_SIZE):
+            for x in range(SLICE_SIZE):
+                py0 = y * 2
+                px0 = x * 2
+
+                T = top_hd[py0][pz, px0]
+                R = right_hd[px0][pz, py0]
+                out[py0,     px0]     = (T + R) / 2.0
+                out[py0,     px0 + 1] = top_hd[py0][pz, px0 + 1]
+                out[py0 + 1, px0]     = right_hd[px0][pz, py0 + 1]
+
+                # 6-neighbor estimate for unknown corner
+                neighbors = []
+                # Z neighbors from FrontHD
+                neighbors.append(front_hd[n    ][py0 + 1, px0 + 1])
+                neighbors.append(front_hd[n + 1][py0 + 1, px0 + 1])
+                # Y neighbors from TopHD (adjacent HD rows)
+                ty_lo = clamp(py0 - 1, 0, HD - 1)
+                ty_hi = clamp(py0 + 2, 0, HD - 1)
+                neighbors.append(top_hd[ty_lo][pz, px0 + 1])
+                neighbors.append(top_hd[ty_hi][pz, px0 + 1])
+                # X neighbors from RightHD (adjacent HD cols)
+                rx_lo = clamp(px0 - 1, 0, HD - 1)
+                rx_hi = clamp(px0 + 2, 0, HD - 1)
+                neighbors.append(right_hd[rx_lo][pz, py0 + 1])
+                neighbors.append(right_hd[rx_hi][pz, py0 + 1])
+
+                out[py0 + 1, px0 + 1] = sum(neighbors) / len(neighbors)
+
+        volume_to_image(out).save(out_path)
+        if n % 20 == 0:
+            print(f"  FrontMod2HD: {n}/{num_interleaved}")
+
+    print(f"FrontMod2HD: {num_interleaved} slices")
 
 
 def step_upscale_frontmod2(base: Path):
@@ -208,8 +271,9 @@ def main():
 
     step_generate_top_right(base, vol)
     step_upscale_all(base)
-    step_build_frontmod2ld(base)
-    step_upscale_frontmod2(base)
+    step_build_frontmod2hd(base) #just estimate missing 1/8 pixel
+    #step_build_frontmod2ld(base) #old passes trying to upscale
+    #step_upscale_frontmod2(base)
     step_combine(base)
 
     print("Done.")
