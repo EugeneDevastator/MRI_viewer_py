@@ -1,0 +1,28 @@
+unpack the packed atlas into set of tiles. tile size = 256
+atlas source is ./dataset/packed.png
+ordering is like text left to right top to bottom
+unpack into .\dataset\FrontLD
+LD = LowDensity
+
+given set of images for front FrontLD - generate planar slices
+folders are TopLR and RightLD
+if exxists - then skip
+
+then upscaler - upscale each set of slices to 2x resolution.
+output into folders FrontHD TopHD RightHD
+
+upscaler can be used like this:
+from reales4u2d import load_model, reales4u2d
+load_model()  # call once at startup
+result = reales4u2d(some_pil_image)  # call many times, fast - will return image 2x size of original.
+
+
+
+use RightHD ant TopHD pixels to construct in-between Front Slices in lower resolution for upscale.
+one dimension is slice number second dimension is half of pixels y = yid * 2
+for the value average overlapping values of those right and front slices
+write those slices into FrontMod2LD
+upscale them and write to FrontMod2HD - meaning this is interleaved second set of slices needed for upscaled 3d texture
+
+combine FrontHD and FrontMod2HD files into sequence in final folder FrontCompleteHD
+
