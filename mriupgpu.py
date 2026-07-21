@@ -113,64 +113,62 @@ def step_build_frontmod2hd(base: Path):
     HD = SLICE_SIZE * 2  # 512
 
     print("Allocating 512^3 volume...")
-    vol    = np.zeros((HD, HD, HD), dtype=np.float32)
-    filled = np.zeros((HD, HD, HD), dtype=np.uint8)
+    vol   = np.zeros((HD, HD, HD), dtype=np.float32)
+    count = np.zeros((HD, HD, HD), dtype=np.uint8)
 
     print(f"Loading FrontHD ({len(front_hd_files)} slices)...")
     for n, f in enumerate(front_hd_files):
         hz = n * 2
         if hz >= HD: break
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
-        vol[hz, :, :] = arr
-        filled[hz, :, :] = 1
+        vol[hz, :, :] += arr
+        count[hz, :, :] += 1
 
     print(f"Loading TopHD ({len(top_files)} slices)...")
     for ld_y, f in enumerate(top_files):
         hy = ld_y * 2
         if hy >= HD: break
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
-        mask = filled[:, hy, :] == 0
-        vol[:, hy, :][mask] = arr[mask]
-        filled[:, hy, :][mask] = 1
+        vol[:, hy, :] += arr
+        count[:, hy, :] += 1
 
     print(f"Loading RightHD ({len(right_files)} slices)...")
     for ld_x, f in enumerate(right_files):
         hx = ld_x * 2
         if hx >= HD: break
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
-        empty = filled[:, :, hx] == 0
-        vol[:, :, hx][empty] = arr[empty]
-        filled[:, :, hx][empty] = 1
+        vol[:, :, hx] += arr
+        count[:, :, hx] += 1
 
+    print("Averaging accumulated samples...")
+    filled_mask = count > 0
+    vol[filled_mask] /= count[filled_mask].astype(np.float32)
 
     print("Estimating unknowns (vectorized)...")
-
-    for pass_num in range(4):  # a few passes handles odd+odd+odd corners
-        unfilled = filled == 0
-        count = unfilled.sum()
-        if count == 0:
+    for pass_num in range(4):
+        unfilled = ~filled_mask
+        n_unfilled = unfilled.sum()
+        if n_unfilled == 0:
             break
-        print(f"  Pass {pass_num+1}: {count} unfilled")
+        print(f"  Pass {pass_num+1}: {n_unfilled} unfilled")
 
-        # accumulate neighbor sum and count vectorized
-        acc   = np.zeros((HD, HD, HD), dtype=np.float32)
-        cnt   = np.zeros((HD, HD, HD), dtype=np.float32)
+        acc = np.zeros((HD, HD, HD), dtype=np.float32)
+        cnt = np.zeros((HD, HD, HD), dtype=np.float32)
 
-        # 6 neighbors via slicing with padding
-        vp = np.pad(vol,    1, mode='edge')
-        fp = np.pad(filled, 1, mode='edge').astype(np.float32)
+        vp = np.pad(vol,          1, mode='edge')
+        fp = np.pad(filled_mask.astype(np.float32), 1, mode='edge')
 
         for dz, dy, dx in [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)]:
             nz = slice(1+dz, HD+1+dz)
             ny = slice(1+dy, HD+1+dy)
             nx = slice(1+dx, HD+1+dx)
-            neighbor_filled = fp[nz, ny, nx]
-            acc += vp[nz, ny, nx] * neighbor_filled
-            cnt += neighbor_filled
+            nf = fp[nz, ny, nx]
+            acc += vp[nz, ny, nx] * nf
+            cnt += nf
 
         has_neighbors = (cnt > 0) & unfilled
-        vol[has_neighbors]    = acc[has_neighbors] / cnt[has_neighbors]
-        filled[has_neighbors] = 1
+        vol[has_neighbors]          = acc[has_neighbors] / cnt[has_neighbors]
+        filled_mask[has_neighbors]  = True
 
     print("Extracting interleaved slices...")
     num_interleaved = TARGET_DEPTH - 1
@@ -182,8 +180,6 @@ def step_build_frontmod2hd(base: Path):
         volume_to_image(vol[hz, :, :]).save(out_path)
 
     print(f"FrontMod2HD: {num_interleaved} slices done")
-
-
 
 
 def step_combine(base: Path):
