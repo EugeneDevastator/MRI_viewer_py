@@ -126,6 +126,10 @@ def step_build_frontmod2hd(base: Path):
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
         vol[hz, :, :] += arr
         count[hz, :, :] += 1
+        vol[hz+1, :, :] += arr
+        count[hz+1, :, :] += 1
+        vol[hz-1, :, :] += arr
+        count[hz-1, :, :] += 1
 
     # TopHD: even Y positions, all Z and X — accumulate freely
     print(f"Loading TopHD ({len(top_files)} slices)...")
@@ -135,6 +139,10 @@ def step_build_frontmod2hd(base: Path):
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
         vol[:, hy, :] += arr
         count[:, hy, :] += 1
+        vol[:, hy+1, :] += arr
+        count[:, hy+1, :] += 1
+        vol[:, hy-1, :] += arr
+        count[:, hy-1, :] += 1        
 
     # RightHD: even X positions, all Z and Y — accumulate freely
     print(f"Loading RightHD ({len(right_files)} slices)...")
@@ -144,6 +152,10 @@ def step_build_frontmod2hd(base: Path):
         arr = np.array(Image.open(f).convert("L"), dtype=np.float32)
         vol[:, :, hx] += arr
         count[:, :, hx] += 1
+        vol[:, :, hx+1] += arr
+        count[:, :, hx+1] += 1
+        vol[:, :, hx-1] += arr
+        count[:, :, hx-1] += 1
 
     print("Averaging accumulated samples...")
     filled_mask = count > 0
@@ -166,7 +178,7 @@ def step_build_frontmod2hd(base: Path):
         vol[gz,   gy,   gx-1],
         vol[gz,   gy,   gx+1],
     ], axis=0)
-    vol[gz, gy, gx] = neighbors.mean(axis=0)
+    # vol[gz, gy, gx] = neighbors.mean(axis=0)
 
     # Extract interleaved slices at odd Z positions (512x512 each)
     # Shrink to 256x256 to smooth interpolation artifacts, then neural upscale back to 512x512
@@ -181,8 +193,9 @@ def step_build_frontmod2hd(base: Path):
         if is_black_image(slice_512):
             Image.new("L", (HD, HD), 0).save(out_path)
         else:
-            slice_256 = slice_512.resize((SLICE_SIZE, SLICE_SIZE), Image.LANCZOS)
-            reales4u2d(slice_256).save(out_path)
+            slice_512.save(out_path)
+            #slice_256 = slice_512.resize((SLICE_SIZE, SLICE_SIZE), Image.LANCZOS)
+            #reales4u2d(slice_256).save(out_path)
 
         if n % 20 == 0:
             print(f"  slice {n}/{TARGET_DEPTH}")
